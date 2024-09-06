@@ -44,7 +44,7 @@ def send_text_to_istex_service(full_text):
 
 
 # Function to preprocess all blocks using the ISTEX service for the entire text
-def preprocess_all_blocks(blocks, frequency_threshold=2):
+def preprocess_all_blocks(blocks, frequency_threshold=1):
     preprocessed_blocks = {}
     sentence_mappings = {}
 
@@ -118,14 +118,9 @@ def calculate_FF_bar(FF):
     FF_bar = FF.mean()
     return FF_bar
 
-# Function to calculate contrast based on F-measure and global mean
-def calculate_contrast(FF_block, FF_bar):
-    contrast = FF_block.div(FF_bar, axis=0).fillna(0)
-    return contrast
-
-# Function to compute contrast scores for each sentence in the blocks
-def compute_contrast_for_sentences(sentence_mappings, preprocessed_blocks, total_frequencies, FF_bar):
-    contrasts = []
+# Function to compute f_measures scores for each sentence in the blocks
+def compute_f_measures_for_sentences(sentence_mappings, preprocessed_blocks, total_frequencies, FF_bar):
+    f_measures = []
     
     for block_name, sentence_to_words in sentence_mappings.items():
         block_f_measure = compute_f_measure(preprocessed_blocks[block_name], total_frequencies)
@@ -133,18 +128,16 @@ def compute_contrast_for_sentences(sentence_mappings, preprocessed_blocks, total
         block_f_measure_filtered = {word: f_measure for word, f_measure in block_f_measure.items() if f_measure >= FF_bar[word]}
         block_ff = pd.Series(block_f_measure_filtered)
         
-        block_contrast = calculate_contrast(block_ff, FF_bar)
-        
         for sentence, words in sentence_to_words:
-            # Use the preprocessed words directly to calculate the sentence score
-            sentence_score = sum(block_contrast.get(word, 0) for word in words)
-            contrasts.append((sentence, sentence_score, block_name))
-    return contrasts
+            sentence_score = sum(block_ff.get(word, 0) for word in words)  # Now using F-metric directly
+            f_measures.append((sentence, sentence_score, block_name))
 
-# Function to find the plateau point in combined contrast scores
-def find_plateau_point_with_tolerance(combined_contrasts, window_size=5, tolerance=0.1):
-    sorted_contrasts = sorted(combined_contrasts, key=lambda x: x[1], reverse=True)
-    scores = [score for _, score, _ in sorted_contrasts]
+    return f_measures
+
+# Function to find the plateau point in combined f_measures scores
+def find_plateau_point_with_tolerance(combined_f_measures, window_size=5, tolerance=0.1):
+    sorted_f_measures = sorted(combined_f_measures, key=lambda x: x[1], reverse=True)
+    scores = [score for _, score, _ in sorted_f_measures]
     differences = np.diff(scores)
 
     # Iterate through the differences with a sliding window
@@ -174,14 +167,14 @@ def generate_summary(sentence_mappings, preprocessed_blocks):
     FF = pd.DataFrame(block_f_measures).fillna(0)
     FF_bar = calculate_FF_bar(FF)
     
-    # Compute contrast for sentences
-    contrasts = compute_contrast_for_sentences(sentence_mappings, preprocessed_blocks, total_frequencies, FF_bar)
-    # Combine all blocks' contrast scores for global plateau detection
-    plateau_point = 4#find_plateau_point_with_tolerance(contrasts, window_size=4, tolerance=0.3)
+    # Compute f-metric for sentences
+    f_measures = compute_f_measures_for_sentences(sentence_mappings, preprocessed_blocks, total_frequencies, FF_bar)
+    # Combine all blocks' f_measures scores for global plateau detection
+    plateau_point = 4#find_plateau_point_with_tolerance(f_measures, window_size=4, tolerance=0.3)
     
     # Select sentences before the plateau point
-    sorted_contrasts = sorted(contrasts, key=lambda x: x[1], reverse=True)
-    summary_sentences = [sentence for sentence, _, _ in sorted_contrasts[:plateau_point]]
+    sorted_f_measures = sorted(f_measures, key=lambda x: x[1], reverse=True)
+    summary_sentences = [sentence for sentence, _, _ in sorted_f_measures[:plateau_point]]
     
     # Print the sentences in the original order based on the sentence_mappings
     final_summary = []
@@ -190,18 +183,18 @@ def generate_summary(sentence_mappings, preprocessed_blocks):
             if sentence in summary_sentences:
                 final_summary.append(sentence)
     
-    summary_contrasts = rank_sentences_by_contrast(contrasts, summary_sentences)
+    summary_f_measures = rank_sentences_by_f_measures(f_measures, summary_sentences)
     
-    return ' '.join(final_summary), summary_contrasts, plateau_point, contrasts
+    return ' '.join(final_summary), summary_f_measures, plateau_point, f_measures
 
 # Function to rank sentences and keep order by original text
-def rank_sentences_by_contrast(contrasts, summary_sentences):
-    # Filter contrasts to include only sentences in the summary
-    summary_contrasts = [(sentence, score, block) for sentence, score, block in contrasts if sentence in summary_sentences]
-    return summary_contrasts
+def rank_sentences_by_f_measures(f_measures, summary_sentences):
+    # Filter f_measures to include only sentences in the summary
+    summary_f_measures = [(sentence, score, block) for sentence, score, block in f_measures if sentence in summary_sentences]
+    return summary_f_measures
 
 # Function to create a word graph for the summary sentences
-def create_word_graph(sentence_mappings, summary_contrasts):
+def create_word_graph(sentence_mappings, summary_f_measures):
     G = nx.Graph()
     
     # Create nodes for words and blocks
@@ -210,7 +203,7 @@ def create_word_graph(sentence_mappings, summary_contrasts):
     
     word_to_blocks = defaultdict(set)
     
-    for sentence, contrast, block_name in summary_contrasts:
+    for sentence, f_measures, block_name in summary_f_measures:
         # Find the corresponding preprocessed words for this sentence
         preprocessed_words = None
         for sent, words in sentence_mappings[block_name]:
@@ -290,19 +283,19 @@ def plot_word_graph(G):
     # Draw block labels with thicker font and a different color
     nx.draw_networkx_labels(G, pos, labels={node: node for node in block_nodes}, font_size=10, font_color='darkblue', font_weight='bold')
 
-    plt.title("Word-Block Graph with Normalized Contrast-Based Distances and Circular Block Layout")
+    plt.title("Word-Block Graph with Normalized f_measures-Based Distances and Circular Block Layout")
     plt.legend()
     plt.show()
 
-def plot_sentence_contrasts(blocks, contrasts, plateau_point):
-    combined_contrasts = sorted(contrasts, key=lambda x: x[1], reverse=True)
-    # Plotting the combined contrast scores
-    x_values = range(1, len(combined_contrasts) + 1)
-    y_values = [score for _, score, _ in combined_contrasts]
+def plot_sentence_f_measures(blocks, f_measures, plateau_point):
+    combined_f_measures = sorted(f_measures, key=lambda x: x[1], reverse=True)
+    # Plotting the combined f_measures scores
+    x_values = range(1, len(combined_f_measures) + 1)
+    y_values = [score for _, score, _ in combined_f_measures]
     plt.figure(figsize=(10, 6))
     plt.plot(x_values, y_values, marker='o', linestyle='-', color='b')
     plt.axvline(x=plateau_point, color='r', linestyle='--', label='Plateau Point')
-    plt.title("Combined Sentence Contrast Scores with Plateau Point")
+    plt.title("Combined Sentence f_measures Scores with Plateau Point")
     plt.xlabel("Sentence Index")
 
 
@@ -401,8 +394,8 @@ blocks = remove_similar_sections(parse_tei_file(file_path))
 # Preprocess all blocks
 preprocessed_blocks, sentence_mappings = preprocess_all_blocks(blocks)
 
-# Generate summary and get the contrasts using preprocessed data
-summary, summary_contrast, plateau_point, contrasts = generate_summary(sentence_mappings, preprocessed_blocks)
+# Generate summary and get the f_measures using preprocessed data
+summary, summary_f_measures, plateau_point, f_measures = generate_summary(sentence_mappings, preprocessed_blocks)
 
 
 print("Generated Summary:")
@@ -411,7 +404,7 @@ print(summary)
 print("\nNumber of sentences selected based on the combined plateau detection:")
 print(plateau_point)
 
-plot_sentence_contrasts(sentence_mappings, contrasts, plateau_point)
+plot_sentence_f_measures(sentence_mappings, f_measures, plateau_point)
 
-G = create_word_graph(sentence_mappings, summary_contrast)
+G = create_word_graph(sentence_mappings, summary_f_measures)
 plot_word_graph(G)
