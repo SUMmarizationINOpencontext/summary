@@ -3,7 +3,10 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
 from collections import defaultdict
+from nltk.stem import WordNetLemmatizer
+from nltk.corpus import stopwords
 from nltk.tokenize import sent_tokenize
+from matplotlib.widgets import Slider
 import networkx as nx
 import itertools
 import requests
@@ -43,56 +46,75 @@ def send_text_to_istex_service(full_text):
         return []
 
 
-# Function to preprocess all blocks using the ISTEX service for the entire text
 def preprocess_all_blocks(blocks, frequency_threshold=1):
+    lemmatizer = WordNetLemmatizer()
+    stop_words = set(stopwords.words('english'))
     preprocessed_blocks = {}
     sentence_mappings = {}
-
-    # Combine all blocks into a single full text
-    full_text = ' '.join(blocks.values())
-
-    # Send the entire text to ISTEX and get extracted terms
-    extracted_terms = send_text_to_istex_service(full_text)
     
-    # Initialize a dictionary to count global frequencies across all blocks
+    # Dictionary to store the lemmatized form and original term mapping
+    lemmatized_to_original = {}
+    
+    # Global frequency count for terms across all blocks
     global_frequencies = defaultdict(int)
 
-    # For each block, tokenize into sentences and assign terms
+    # Helper function to lemmatize and remove stop words from a term
+    def clean_and_lemmatize(term):
+        words = term.lower().split()
+        lemmatized_words = [lemmatizer.lemmatize(word) for word in words if word not in stop_words]
+        return ' '.join(lemmatized_words)
+    
+    # Step 1: Combine all blocks into a single text to extract terms
+    full_text = ' '.join(blocks.values())
+    extracted_terms = send_text_to_istex_service(full_text)
+
+    # Step 2: Process terms to lemmatize and remove stop words
+    for term in extracted_terms:
+        lemmatized_term = clean_and_lemmatize(term)
+        if lemmatized_term:
+            if lemmatized_term not in lemmatized_to_original:
+                lemmatized_to_original[lemmatized_term] = term
+            else:
+                # If a new term with the same lemmatized form exists, keep the shorter one
+                current_term = lemmatized_to_original[lemmatized_term]
+                if len(term) < len(current_term):
+                    lemmatized_to_original[lemmatized_term] = term
+
+    # Step 3: Process each block to update terms and recalculate frequencies
     for block_name, block_text in blocks.items():
-        # Tokenize block into sentences
         sentences = sent_tokenize(block_text)
-        
-        # Initialize data structures for this block
         word_frequencies = defaultdict(int)
         sentence_to_words = []
 
-        # Match extracted terms to sentences within this block
+        # Step 4: Process each sentence in the block
         for sentence in sentences:
             matched_terms = []
-
-            # Check if the term appears in the sentence
+            
             for term in extracted_terms:
                 if term.lower() in sentence.lower():
-                    matched_terms.append(term)
-                    global_frequencies[term] += 1  # Update global frequency count
+                    lemmatized_term = clean_and_lemmatize(term)
+                    # Use the shorter original term
+                    original_term = lemmatized_to_original[lemmatized_term]
+                    matched_terms.append(original_term)
+                    global_frequencies[original_term] += 1  # Update global frequency count
 
-            # Update word frequencies for the current block
+            # Update term frequencies in the block
             for term in matched_terms:
                 word_frequencies[term] += 1
 
-            # Store the final matched terms for this sentence
+            # Store the sentence and its matched terms
             sentence_to_words.append((sentence, matched_terms))
         
-        # Store results for this block before filtering
+        # Store preprocessed data for the block
         preprocessed_blocks[block_name] = word_frequencies
         sentence_mappings[block_name] = sentence_to_words
 
-    # Filter terms based on the frequency threshold
+    # Step 5: Filter terms based on frequency threshold
     for block_name in preprocessed_blocks:
-        # Filter out terms that do not meet the frequency threshold
+        # Filter out terms that don't meet the threshold
         preprocessed_blocks[block_name] = {term: freq for term, freq in preprocessed_blocks[block_name].items() if global_frequencies[term] > frequency_threshold}
-
-        # Update sentence_to_words to exclude low-frequency terms
+        
+        # Update the sentence mappings to exclude low-frequency terms
         sentence_mappings[block_name] = [
             (sentence, [term for term in terms if global_frequencies[term] > frequency_threshold])
             for sentence, terms in sentence_mappings[block_name]
@@ -112,6 +134,25 @@ def compute_f_measure(block_frequencies, total_frequencies):
         f_measures[word] = f_measure
     
     return f_measures
+
+# Function to compute F-measure for words in all blocks and calculate total frequencies
+def calculate_word_f_measures(preprocessed_blocks):
+    total_frequencies = defaultdict(int)
+    word_f_measures = []
+
+    # Step 1: Calculate total frequencies across all blocks
+    for block_name, block_frequencies in preprocessed_blocks.items():
+        for word, count in block_frequencies.items():
+            total_frequencies[word] += count
+
+    # Step 2: Calculate F-measure for each word in each block
+    for block_name, block_frequencies in preprocessed_blocks.items():
+        block_f_measure = compute_f_measure(block_frequencies, total_frequencies)
+        
+        for word, f_measure in block_f_measure.items():
+            word_f_measures.append((word, f_measure, block_name))
+    
+    return word_f_measures
 
 # Function to calculate the mean F-measure across all blocks
 def calculate_FF_bar(FF):
@@ -170,7 +211,7 @@ def generate_summary(sentence_mappings, preprocessed_blocks):
     # Compute f-metric for sentences
     f_measures = compute_f_measures_for_sentences(sentence_mappings, preprocessed_blocks, total_frequencies, FF_bar)
     # Combine all blocks' f_measures scores for global plateau detection
-    plateau_point = 4#find_plateau_point_with_tolerance(f_measures, window_size=4, tolerance=0.3)
+    plateau_point = find_plateau_point_with_tolerance(f_measures, window_size=3, tolerance=0.01)
     
     # Select sentences before the plateau point
     sorted_f_measures = sorted(f_measures, key=lambda x: x[1], reverse=True)
@@ -193,98 +234,112 @@ def rank_sentences_by_f_measures(f_measures, summary_sentences):
     summary_f_measures = [(sentence, score, block) for sentence, score, block in f_measures if sentence in summary_sentences]
     return summary_f_measures
 
-# Function to create a word graph for the summary sentences
-def create_word_graph(sentence_mappings, summary_f_measures):
+# Function to filter and create a word graph based on F-measure threshold
+def create_filtered_word_graph(word_f_measures, f_threshold):
     G = nx.Graph()
     
     # Create nodes for words and blocks
     word_nodes = set()
-    block_nodes = set(sentence_mappings.keys())
-    
+    block_nodes = set()
     word_to_blocks = defaultdict(set)
     
-    for sentence, f_measures, block_name in summary_f_measures:
-        # Find the corresponding preprocessed words for this sentence
-        preprocessed_words = None
-        for sent, words in sentence_mappings[block_name]:
-            if sent == sentence:
-                preprocessed_words = words
-                break
-
-        if preprocessed_words is None:
-            continue  # If no matching preprocessed words found, skip to the next sentence
-        
-        block_nodes.add(block_name)
-        
-        for word in preprocessed_words:
+    # Iterate over word F-measures, add words and blocks based on the F-measure threshold
+    for word, f_score, block_name in word_f_measures:
+        if f_score >= f_threshold:  # Only consider words with F-measure above the threshold
             word_nodes.add(word)
+            block_nodes.add(block_name)
             word_to_blocks[word].add(block_name)
     
     for block in block_nodes:
         G.add_node(block, type='block')
     
-    # Add nodes and edges only for words that are in the summary and connected to blocks
+    # Add nodes and edges only for words that meet the F-measure threshold and connect to blocks
     for word in word_nodes:
         G.add_node(word, type='word')
         for block in word_to_blocks[word]:
-            # Add an edge between the word and its associated blocks with the 'block' attribute
             weight = 1 / len(word_to_blocks[word])  # Example weight calculation, can be adjusted
-            G.add_edge(word, block, weight=weight, block=block)  # Set the 'block' attribute here
+            f_measure = next(f for w, f, b in word_f_measures if w == word and b == block)  # Get F-measure for this word-block pair
+            G.add_edge(word, block, weight=weight, block=block, f_measure=f_measure)  # Add F-measure as edge attribute
     
     return G
 
-def plot_word_graph(G):
-    # Extract block nodes
-    block_nodes = [node for node, data in G.nodes(data=True) if data['type'] == 'block']
-    num_blocks = len(block_nodes)
+# Function to plot the word graph and integrate a slider for filtering by F-measure
+def interactive_plot_word_graph(word_f_measures):
+    fig, ax = plt.subplots(figsize=(12, 12))
+    plt.subplots_adjust(bottom=0.25)  # Make space for slider
 
-    # Calculate positions for block nodes in a circular layout
-    angle_step = 2 * np.pi / num_blocks
-    block_pos = {
-        block: (np.cos(i * angle_step), np.sin(i * angle_step))
-        for i, block in enumerate(block_nodes)
-    }
+    # Initial plot with no filtering (using minimum F-measure)
+    f_threshold = min([score for _, score, _ in word_f_measures])
+    G = create_filtered_word_graph(word_f_measures, f_threshold)
 
-    # Generate initial positions for the graph with block nodes fixed
-    pos = nx.spring_layout(G, pos=block_pos, fixed=block_nodes, seed=42, weight='weight')
-
-    plt.figure(figsize=(14, 14))
-
-    # Draw nodes with different colors for words and blocks
+    pos = nx.spring_layout(G, seed=42)
     word_nodes = [node for node, data in G.nodes(data=True) if data['type'] == 'word']
+    block_nodes = [node for node, data in G.nodes(data=True) if data['type'] == 'block']
 
-    nx.draw_networkx_nodes(G, pos, nodelist=word_nodes, node_color='lightblue', node_size=100, label='Words')
-    nx.draw_networkx_nodes(G, pos, nodelist=block_nodes, node_color='orange', node_size=300, label='Blocks')
+    # Create consistent colors for blocks
+    block_colors = {block: color for block, color in zip(block_nodes, itertools.cycle(['red', 'blue', 'green', 'purple', 'orange']))}
 
-    # Normalize the edge weights to make them thinner
-    edges = G.edges(data=True)
+    # Draw nodes for words and blocks
+    nx.draw_networkx_nodes(G, pos, nodelist=word_nodes, node_color='lightblue', node_size=100, label='Words', ax=ax)
+    nx.draw_networkx_nodes(G, pos, nodelist=block_nodes, node_color=[block_colors[block] for block in block_nodes], node_size=300, label='Blocks', ax=ax)
+    
+    # Draw edges and display F-measures in the middle of the edges
+    edge_labels = {}
+    for u, v, data in G.edges(data=True):
+        f_measure = data['f_measure']
+        edge_labels[(u, v)] = f'{f_measure:.2f}'  # F-measure as label in the middle of the edge
+    
+    nx.draw_networkx_edges(G, pos, ax=ax)
+    nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=8, font_color='darkgreen', ax=ax)
 
-    # Generate a color cycle for different blocks
-    colors = itertools.cycle([
-        'red', 'blue', 'green', 'purple', 'orange', 'brown', 'pink', 'gray',
-        'yellow', 'cyan', 'magenta', 'lime', 'teal', 'maroon', 'navy', 'olive',
-        'aqua', 'fuchsia', 'gold', 'indigo'])
-    block_colors = {block: next(colors) for block in block_nodes}
+    # Add labels for block nodes (block names)
+    block_labels = {block: block for block in block_nodes}
+    nx.draw_networkx_labels(G, pos, labels=block_labels, font_size=10, font_color='darkblue', font_weight='bold', ax=ax)
 
-    # Draw edges with different colors for each block
-    for block in block_nodes:
-        block_edges = [(u, v) for u, v, d in edges if d['block'] == block]
-        if block_edges:  # Ensure there are edges to process
-            weights = np.array([1 / G[u][v]['weight'] if G[u][v]['weight'] > 0 else 1 for u, v in block_edges])
-            if len(weights) > 0 and np.max(weights) != np.min(weights):  # Ensure weights are non-empty and not all the same
-                normalized_weights = 0.5 + 2 * (weights - np.min(weights)) / (np.max(weights) - np.min(weights))
-            else:
-                normalized_weights = np.ones(len(weights))  # Assign a default value if no meaningful normalization is possible
-            nx.draw_networkx_edges(G, pos, edgelist=block_edges, width=normalized_weights, edge_color=block_colors[block])
+    # Add labels for word nodes (terms)
+    word_labels = {word: word for word in word_nodes}
+    nx.draw_networkx_labels(G, pos, labels=word_labels, font_size=8, font_color='black', ax=ax)
 
-    # Draw labels with a custom color
-    nx.draw_networkx_labels(G, pos, labels={node: node for node in word_nodes}, font_size=8, font_color='darkred')
+    # Create a slider for F-measure threshold
+    ax_slider = plt.axes([0.2, 0.1, 0.65, 0.03], facecolor='lightgray')
+    slider = Slider(ax_slider, 'F-measure', min([score for _, score, _ in word_f_measures]), max([score for _, score, _ in word_f_measures]), valinit=f_threshold)
 
-    # Draw block labels with thicker font and a different color
-    nx.draw_networkx_labels(G, pos, labels={node: node for node in block_nodes}, font_size=10, font_color='darkblue', font_weight='bold')
+    # Function to update the graph based on slider value
+    def update(val):
+        f_threshold = slider.val
+        ax.clear()  # Clear current graph
+        
+        # Recreate and plot graph based on the new F-measure threshold
+        G = create_filtered_word_graph(word_f_measures, f_threshold)
+        pos = nx.spring_layout(G, seed=42)
+        word_nodes = [node for node, data in G.nodes(data=True) if data['type'] == 'word']
+        block_nodes = [node for node, data in G.nodes(data=True) if data['type'] == 'block']
 
-    plt.title("Word-Block Graph with Normalized f_measures-Based Distances and Circular Block Layout")
-    plt.legend()
+        # Draw nodes with consistent colors for blocks
+        nx.draw_networkx_nodes(G, pos, nodelist=word_nodes, node_color='lightblue', node_size=100, label='Words', ax=ax)
+        nx.draw_networkx_nodes(G, pos, nodelist=block_nodes, node_color=[block_colors[block] for block in block_nodes], node_size=300, label='Blocks', ax=ax)
+        
+        # Draw edges and display F-measures in the middle of the edges
+        edge_labels = {}
+        for u, v, data in G.edges(data=True):
+            f_measure = data['f_measure']
+            edge_labels[(u, v)] = f'{f_measure:.2f}'  # F-measure as label in the middle of the edge
+        
+        nx.draw_networkx_edges(G, pos, ax=ax)
+        nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=8, font_color='darkgreen', ax=ax)
+
+        # Add labels for block nodes (block names)
+        block_labels = {block: block for block in block_nodes}
+        nx.draw_networkx_labels(G, pos, labels=block_labels, font_size=10, font_color='darkblue', font_weight='bold', ax=ax)
+
+        # Add labels for word nodes (terms)
+        word_labels = {word: word for word in word_nodes}
+        nx.draw_networkx_labels(G, pos, labels=word_labels, font_size=8, font_color='black', ax=ax)
+
+        fig.canvas.draw_idle()  # Redraw the graph
+
+    # Update graph when slider is moved
+    slider.on_changed(update)
     plt.show()
 
 def plot_sentence_f_measures(blocks, f_measures, plateau_point):
@@ -386,17 +441,14 @@ def remove_similar_sections(blocks):
 # Example usage
 file_path = os.path.join(os.getcwd(), 'text.tei')
 
-
 # Remove similar sections where one has more than half of its words in the other
 blocks = remove_similar_sections(parse_tei_file(file_path))
-
 
 # Preprocess all blocks
 preprocessed_blocks, sentence_mappings = preprocess_all_blocks(blocks)
 
 # Generate summary and get the f_measures using preprocessed data
 summary, summary_f_measures, plateau_point, f_measures = generate_summary(sentence_mappings, preprocessed_blocks)
-
 
 print("Generated Summary:")
 print(summary)
@@ -406,5 +458,4 @@ print(plateau_point)
 
 plot_sentence_f_measures(sentence_mappings, f_measures, plateau_point)
 
-G = create_word_graph(sentence_mappings, summary_f_measures)
-plot_word_graph(G)
+interactive_plot_word_graph(calculate_word_f_measures(preprocessed_blocks))
