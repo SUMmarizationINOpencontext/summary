@@ -12,7 +12,10 @@ from peft import LoraConfig, get_peft_model
 import os
 
 # Suppress tokenizer parallelism warnings
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 
 # Set device (optional)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -35,7 +38,7 @@ additional_special_tokens = [v for k, v in special_tokens.items() if k not in ['
 model_name = "meta-llama/Meta-Llama-3.1-8B-Instruct"  # Replace with the model you have access to
 
 # Initialize the tokenizer
-tokenizer = AutoTokenizer.from_pretrained(model_name)
+tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side = "left")
 
 # Add special tokens to the tokenizer
 special_tokens_dict = {
@@ -51,10 +54,14 @@ model = AutoModelForCausalLM.from_pretrained(
     model_name,
     device_map="auto",       # Automatically distribute the model across GPUs
     torch_dtype=torch.float16,
+    attn_implementation = 'flash_attention_2'
+
 )
 
 # Resize model embeddings to match the tokenizer
 model.resize_token_embeddings(len(tokenizer))
+
+model.config.use_cache = False
 
 # Configure LoRA settings
 lora_config = LoraConfig(
@@ -139,14 +146,6 @@ input_json = 'processed_articles.json'
 summary_json = 'summary_output.json'
 dataset = prepare_datasets(input_json, summary_json)
 
-if dataset is None:
-    print("Dataset is empty. Exiting.")
-    exit()
-else:
-    print(f"Number of examples in the dataset: {len(dataset)}")
-    print("First example:")
-    print(dataset[0])
-
 # Tokenization and preprocessing
 def preprocess_batch(batch):
     # Define the system prompt
@@ -192,8 +191,9 @@ training_args = TrainingArguments(
     logging_dir="./logs",
     logging_steps=500,
     save_strategy="epoch",             # Save at each epoch
-    eval_strategy="epoch",             # Updated argument name
+    eval_strategy="no",             # Updated argument name
     fp16=True,                         # Use FP16 for memory efficiency
+    bf16=False,
     learning_rate=2e-5,
     weight_decay=0.01,
     warmup_steps=500,
@@ -202,6 +202,7 @@ training_args = TrainingArguments(
     dataloader_num_workers=4,
     remove_unused_columns=False,       # Prevents the Trainer from dropping necessary columns
     ddp_find_unused_parameters=False,  # Important for LoRA with DDP
+    eval_accumulation_steps = 4
 )
 
 # Step 5: Set up the data collator
@@ -212,7 +213,7 @@ trainer = Trainer(
     model=model,
     args=training_args,
     train_dataset=tokenized_dataset,
-    eval_dataset=tokenized_dataset,  # You can create a separate validation set if needed
+    #noeval_dataset=tokenized_dataset,  # You can create a separate validation set if needed
     data_collator=data_collator
 )
 
