@@ -1,0 +1,8 @@
+loaders:
+  - type: python
+    search_path: ["."]
+    packages:
+      - summary_updated
+
+renderers:
+  - type: markdown
